@@ -1,0 +1,1323 @@
+# SPDX-License-Identifier: Apache-2.0
+
+# Adapted from
+# https://github.com/huggingface/transformers/blob/v4.28.0/src/transformers/models/llama/modeling_llama.py
+# Copyright 2023 The vLLM team.
+# Copyright 2023 DeepSeek-AI and the HuggingFace Inc. team. All rights reserved.
+#
+# This code is based on EleutherAI's GPT-NeoX library and the GPT-NeoX
+# and OPT implementations in this library. It has been modified from its
+# original forms to accommodate minor architectural differences compared
+# to GPT-NeoX and OPT used by the Meta AI team that trained the model.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Inference-only DeepseekV2/DeepseekV3 model."""
+from typing import Any, Dict, Iterable, Optional, Set, Tuple, Union
+
+import torch
+import os
+from torch import nn
+from transformers import PretrainedConfig
+
+from vllm.attention import Attention, AttentionMetadata
+from vllm.forward_context import get_forward_context
+from vllm.compilation.decorators import support_torch_compile
+from vllm.config import CacheConfig, ModelConfig, VllmConfig
+from vllm.distributed import (get_pp_group, get_dp_group, 
+                              get_tensor_model_parallel_rank,
+                              get_tensor_model_parallel_world_size,
+                              tensor_model_parallel_all_reduce)
+from vllm.model_executor.layers.activation import SiluAndMul
+from vllm.model_executor.layers.fused_moe import FusedMoE
+from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.model_executor.layers.linear import (ColumnParallelLinear,
+                                               MergedColumnParallelLinear,
+                                               ReplicatedLinear,
+                                               RowParallelLinear)
+from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.rotary_embedding import get_rope
+from vllm.model_executor.layers.vocab_parallel_embedding import (
+    ParallelLMHead, VocabParallelEmbedding)
+from vllm.model_executor.model_loader.weight_utils import (
+    default_weight_loader, maybe_remap_kv_scale_name)
+from vllm.model_executor.sampling_metadata import SamplingMetadata
+from vllm.sequence import IntermediateTensors
+
+from .interfaces import SupportsPP
+from .utils import (PPMissingLayer, is_pp_missing_parameter,
+                    make_empty_intermediate_tensors_factory, make_layers,
+                    maybe_prefix)
+import time
+
+
+PIPE_ON = True
+
+
+class DeepseekV2MLP(nn.Module):
+
+    def __init__(
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        hidden_act: str,
+        quant_config: Optional[QuantizationConfig] = None,
+        reduce_results: bool = True,
+        prefix: str = "",
+    ) -> None:
+        super().__init__()
+        self.gate_up_proj = MergedColumnParallelLinear(
+            hidden_size, [intermediate_size] * 2,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.gate_up_proj")
+        self.down_proj = RowParallelLinear(intermediate_size,
+                                           hidden_size,
+                                           bias=False,
+                                           quant_config=quant_config,
+                                           reduce_results=reduce_results,
+                                           prefix=f"{prefix}.down_proj")
+        if hidden_act != "silu":
+            raise ValueError(f"Unsupported activation: {hidden_act}. "
+                             "Only silu is supported for now.")
+        self.act_fn = SiluAndMul()
+
+    def forward(self, x):
+        gate_up, _ = self.gate_up_proj(x)
+        x = self.act_fn(gate_up)
+        x, _ = self.down_proj(x)
+        return x
+
+
+class DeepseekV2MoE(nn.Module):
+
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ):
+        super().__init__()
+        self.tp_size = get_tensor_model_parallel_world_size()
+        self.routed_scaling_factor = config.routed_scaling_factor
+        self.n_shared_experts = config.n_shared_experts
+
+        if config.hidden_act != "silu":
+            raise ValueError(f"Unsupported activation: {config.hidden_act}. "
+                             "Only silu is supported for now.")
+
+        self.gate = ReplicatedLinear(config.hidden_size,
+                                     config.n_routed_experts,
+                                     bias=False,
+                                     quant_config=None,
+                                     prefix=f"{prefix}.gate")
+        if config.topk_method == "noaux_tc":
+            self.gate.e_score_correction_bias = nn.Parameter(
+                torch.empty(config.n_routed_experts))
+        else:
+            self.gate.e_score_correction_bias = None
+
+        self.experts = FusedMoE(
+            num_experts=config.n_routed_experts,
+            top_k=config.num_experts_per_tok,
+            hidden_size=config.hidden_size,
+            intermediate_size=config.moe_intermediate_size,
+            reduce_results=False,
+            renormalize=config.norm_topk_prob,
+            quant_config=quant_config,
+            use_grouped_topk=True,
+            num_expert_group=config.n_group,
+            topk_group=config.topk_group,
+            prefix=f"{prefix}.experts",
+            scoring_func=config.scoring_func,
+            e_score_correction_bias=self.gate.e_score_correction_bias)
+
+        if config.n_shared_experts is not None:
+            intermediate_size = (config.moe_intermediate_size *
+                                 config.n_shared_experts)
+            self.shared_experts = DeepseekV2MLP(
+                hidden_size=config.hidden_size,
+                intermediate_size=intermediate_size,
+                hidden_act=config.hidden_act,
+                quant_config=quant_config,
+                reduce_results=False,
+                prefix=f"{prefix}.shared_experts",
+            )
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        num_tokens, hidden_dim = hidden_states.shape
+        hidden_states = hidden_states.view(-1, hidden_dim)
+        if self.n_shared_experts is not None:
+            shared_output = self.shared_experts(hidden_states)
+        # router_logits: (num_tokens, n_experts)
+        router_logits, _ = self.gate(hidden_states)
+        if hidden_states.dtype != torch.float16:
+            final_hidden_states = self.experts(
+                hidden_states=hidden_states,
+                router_logits=router_logits) * self.routed_scaling_factor
+        else:
+            # Fix FP16 overflow
+            # See DeepseekV2DecoderLayer for more details.
+            final_hidden_states = self.experts(hidden_states=hidden_states,
+                                               router_logits=router_logits)
+        if self.n_shared_experts is not None:
+            if hidden_states.dtype != torch.float16:
+                final_hidden_states = final_hidden_states + shared_output
+            else:
+                # This is a special case to avoid FP16 overflow
+                final_hidden_states = final_hidden_states + shared_output \
+                    * (1. / self.routed_scaling_factor)
+        if self.tp_size > 1:
+            final_hidden_states = tensor_model_parallel_all_reduce(
+                final_hidden_states)
+
+        return final_hidden_states.view(num_tokens, hidden_dim)
+
+
+class PipeDeepseekV2MoE(DeepseekV2MoE):
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ):
+        super().__init__(config, quant_config, prefix)
+        self.moe_pipe_degree = config.moe_pipe_degree
+        self._cache = [{} for _ in range(self.moe_pipe_degree)]
+
+    def gating(self, hidden_states: torch.Tensor, residual: torch.Tensor, chunk_idx: int):
+        num_tokens, hidden_dim = hidden_states.shape
+        hidden_states = hidden_states.view(-1, hidden_dim)
+        shared_output = self.shared_experts(hidden_states) if self.n_shared_experts is not None else None
+        router_logits, _ = self.gate(hidden_states)
+        self._cache[chunk_idx]['residual'] = residual
+        self._cache[chunk_idx]['hidden_states'] = hidden_states
+        self._cache[chunk_idx]['router_logits'] = router_logits
+        self._cache[chunk_idx]['shared_output'] = shared_output
+
+    def dispatch(self, chunk_idx: int):
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        
+        start_event.record()
+        
+        hidden_states = self._cache[chunk_idx]['hidden_states']
+        router_logits = self._cache[chunk_idx]['router_logits']
+        dispatched_hidden_states, dispatched_router_logits = self.experts.dispatch(hidden_states, router_logits)
+        self._cache[chunk_idx]['dispatched_states'] = dispatched_hidden_states
+        self._cache[chunk_idx]['dispatched_router_logits'] = dispatched_router_logits
+        
+        end_event.record()
+        torch.cuda.synchronize()
+
+    def pad_chunk_to_alignment(self, chunk, alignment=32):
+        seq_len, hidden_size = chunk.shape
+        padded_len = ((seq_len + alignment - 1) // alignment) * alignment
+        
+        if padded_len > seq_len:
+            padding_size = padded_len - seq_len
+            padding = torch.zeros(padding_size, hidden_size, 
+                                dtype=chunk.dtype, device=chunk.device)
+            chunk = torch.cat([chunk, padding], dim=0)
+        
+        return chunk, seq_len
+    
+    def pad_router_logits_safe(self, router_logits, alignment=32):
+        seq_len, num_experts = router_logits.shape
+        padded_len = ((seq_len + alignment - 1) // alignment) * alignment
+        
+        if padded_len > seq_len:
+            padding_size = padded_len - seq_len
+            
+            padding = torch.full((padding_size, num_experts), 
+                            -1e4, 
+                            dtype=router_logits.dtype, 
+                            device=router_logits.device)
+            router_logits = torch.cat([router_logits, padding], dim=0)
+    
+        return router_logits, seq_len
+    
+    def MoEFwd(self, chunk_idx: int):
+        dispatched_states = self._cache[chunk_idx]['dispatched_states']
+        router_logits = self._cache[chunk_idx]['dispatched_router_logits']
+
+        moe_output = self.experts.MoEFwd(dispatched_states, router_logits)
+        self._cache[chunk_idx]['moe_output'] = moe_output
+
+    def combine(self, chunk_idx: int):
+        """A2A-combine.
+        
+        Call FusedMoE.combine().
+        Combine the dispatched MoE outputs, and apply scaling factor if needed.
+        """
+        
+        moe_output = self._cache[chunk_idx]['moe_output']
+        hidden_states = self._cache[chunk_idx]['hidden_states']  
+        # Get hidden_states to check dtype
+        if hidden_states.dtype != torch.float16:
+            final_hidden_states = self.experts.combine(moe_output) * self.routed_scaling_factor
+        else:
+            # This is a special case to avoid FP16 overflow
+            final_hidden_states = self.experts.combine(moe_output)
+        self._cache[chunk_idx]['final_hidden_states'] = final_hidden_states
+    
+
+    def post_MoE(self, chunk_idx: int) -> torch.Tensor:
+        """Post-processing after A2A-combine.
+        
+        Adding shared expert outputs, and allreduce in TP group (if applicable).
+        """
+        final_hidden_states = self._cache[chunk_idx]['final_hidden_states']
+        shared_output = self._cache[chunk_idx]['shared_output']
+        hidden_states = self._cache[chunk_idx]['hidden_states']
+        num_tokens, hidden_dim = hidden_states.shape
+        if self.n_shared_experts is not None:
+            if hidden_states.dtype != torch.float16:
+                final_hidden_states = final_hidden_states + shared_output
+            else:
+                # Fix FP16 overflow
+                final_hidden_states = final_hidden_states + shared_output \
+                    * (1. / self.routed_scaling_factor)
+        if self.tp_size > 1:
+            final_hidden_states = tensor_model_parallel_all_reduce(
+                final_hidden_states)
+
+        return final_hidden_states.view(num_tokens, hidden_dim), self._cache[chunk_idx]['residual']
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        num_tokens, hidden_dim = hidden_states.shape
+        hidden_states = hidden_states.view(-1, hidden_dim)
+        if self.n_shared_experts is not None:
+            shared_output = self.shared_experts(hidden_states)
+        # router_logits: (num_tokens, n_experts)
+        router_logits, _ = self.gate(hidden_states)
+        if hidden_states.dtype != torch.float16:
+            final_hidden_states = self.experts(
+                hidden_states=hidden_states,
+                router_logits=router_logits) * self.routed_scaling_factor
+        else:
+            # Fix FP16 overflow
+            # See DeepseekV2DecoderLayer for more details.
+            final_hidden_states = self.experts(hidden_states=hidden_states,
+                                               router_logits=router_logits)
+        if self.n_shared_experts is not None:
+            if hidden_states.dtype != torch.float16:
+                final_hidden_states = final_hidden_states + shared_output
+            else:
+                # This is a special case to avoid FP16 overflow
+                final_hidden_states = final_hidden_states + shared_output \
+                    * (1. / self.routed_scaling_factor)
+        if self.tp_size > 1:
+            final_hidden_states = tensor_model_parallel_all_reduce(
+                final_hidden_states)
+
+        return final_hidden_states.view(num_tokens, hidden_dim)
+
+
+def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
+    import math
+    if scale <= 1:
+        return 1.0
+    return 0.1 * mscale * math.log(scale) + 1.0
+
+
+class DeepseekV2Attention(nn.Module):
+
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        hidden_size: int,
+        num_heads: int,
+        qk_nope_head_dim: int,
+        qk_rope_head_dim: int,
+        v_head_dim: int,
+        q_lora_rank: int,
+        kv_lora_rank: int,
+        rope_theta: float = 10000,
+        rope_scaling: Optional[Dict[str, Any]] = None,
+        max_position_embeddings: int = 8192,
+        cache_config: Optional[CacheConfig] = None,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.qk_nope_head_dim = qk_nope_head_dim
+        self.qk_rope_head_dim = qk_rope_head_dim
+        self.qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
+        self.v_head_dim = v_head_dim
+        self.q_lora_rank = q_lora_rank
+        self.kv_lora_rank = kv_lora_rank
+        self.num_heads = num_heads
+        tp_size = get_tensor_model_parallel_world_size()
+        assert num_heads % tp_size == 0
+        self.num_local_heads = num_heads // tp_size
+        self.scaling = self.qk_head_dim**-0.5
+        self.rope_theta = rope_theta
+        self.max_position_embeddings = max_position_embeddings
+
+        if self.q_lora_rank is not None:
+            self.q_a_proj = ReplicatedLinear(self.hidden_size,
+                                             self.q_lora_rank,
+                                             bias=False,
+                                             quant_config=quant_config,
+                                             prefix=f"{prefix}.q_a_proj")
+            self.q_a_layernorm = RMSNorm(self.q_lora_rank,
+                                         eps=config.rms_norm_eps)
+            self.q_b_proj = ColumnParallelLinear(q_lora_rank,
+                                                 self.num_heads *
+                                                 self.qk_head_dim,
+                                                 bias=False,
+                                                 quant_config=quant_config,
+                                                 prefix=f"{prefix}.q_b_proj")
+        else:
+            self.q_proj = ColumnParallelLinear(self.hidden_size,
+                                               self.num_heads *
+                                               self.qk_head_dim,
+                                               bias=False,
+                                               quant_config=quant_config,
+                                               prefix=f"{prefix}.q_proj")
+
+        self.kv_a_proj_with_mqa = ReplicatedLinear(
+            self.hidden_size,
+            self.kv_lora_rank + self.qk_rope_head_dim,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.kv_a_proj_with_mqa")
+        self.kv_a_layernorm = RMSNorm(self.kv_lora_rank,
+                                      eps=config.rms_norm_eps)
+        self.kv_b_proj = ColumnParallelLinear(
+            self.kv_lora_rank,
+            self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.kv_b_proj")
+        # O projection.
+        self.o_proj = RowParallelLinear(self.num_heads * self.v_head_dim,
+                                        self.hidden_size,
+                                        bias=False,
+                                        quant_config=quant_config,
+                                        prefix=f"{prefix}.o_proj")
+        if rope_scaling:
+            rope_scaling["rope_type"] = 'deepseek_yarn'
+
+        self.rotary_emb = get_rope(qk_rope_head_dim,
+                                   rotary_dim=qk_rope_head_dim,
+                                   max_position=max_position_embeddings,
+                                   base=rope_theta,
+                                   rope_scaling=rope_scaling,
+                                   is_neox_style=False)
+
+        if rope_scaling:
+            mscale_all_dim = rope_scaling.get("mscale_all_dim", False)
+            scaling_factor = rope_scaling["factor"]
+            mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
+            self.scaling = self.scaling * mscale * mscale
+
+        self.attn = Attention(self.num_local_heads,
+                              self.qk_head_dim,
+                              self.scaling,
+                              num_kv_heads=self.num_local_heads,
+                              cache_config=cache_config,
+                              quant_config=quant_config,
+                              prefix=f"{prefix}.attn")
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.q_lora_rank is not None:
+            q = self.q_a_proj(hidden_states)[0]
+            q = self.q_a_layernorm(q)
+            q = self.q_b_proj(q)[0].view(-1, self.num_local_heads,
+                                         self.qk_head_dim)
+        else:
+            q = self.q_proj(hidden_states)[0].view(-1, self.num_local_heads,
+                                                   self.qk_head_dim)
+        q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim],
+                               dim=-1)
+        latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
+        kv_a, _ = latent_cache.split(
+            [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+        latent_cache = latent_cache.unsqueeze(1)
+        kv_a = self.kv_a_layernorm(kv_a.contiguous())
+        kv = self.kv_b_proj(kv_a)[0]
+        kv = kv.view(-1, self.num_local_heads,
+                     self.qk_nope_head_dim + self.v_head_dim)
+        k_nope, v = kv.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+        k_pe = latent_cache[:, :, self.kv_lora_rank:]
+
+        q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
+
+        q[..., self.qk_nope_head_dim:] = q_pe
+        k = torch.empty_like(q)
+        k[..., :self.qk_nope_head_dim] = k_nope
+        k[..., self.qk_nope_head_dim:] = k_pe
+        # padding value to qk_head_dim for alignment
+        v = torch.nn.functional.pad(
+            v, [0, self.qk_head_dim - self.v_head_dim],
+            value=0).view(-1, self.num_local_heads * self.qk_head_dim)
+        attn_output = self.attn(q, k, v)
+        attn_output = attn_output.view(
+            -1, self.num_local_heads,
+            self.qk_head_dim)[..., :self.v_head_dim].reshape(
+                -1, self.num_local_heads * self.v_head_dim)
+        output, _ = self.o_proj(attn_output)
+        return output
+
+
+class DeepseekV2MLAAttention(nn.Module):
+    """
+    Main reference: DeepseekV2 paper, and FlashInfer Implementation
+    (https://arxiv.org/abs/2405.04434 and https://github.com/flashinfer-ai/flashinfer/pull/551).
+    
+    For more info see MLACommonImpl in: vllm/attention/backends/mla/utils.py
+    """
+
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        hidden_size: int,
+        num_heads: int,
+        qk_nope_head_dim: int,
+        qk_rope_head_dim: int,
+        v_head_dim: int,
+        q_lora_rank: Optional[int],
+        kv_lora_rank: int,
+        rope_theta: float = 10000,
+        rope_scaling: Optional[Dict[str, Any]] = None,
+        max_position_embeddings: int = 8192,
+        cache_config: Optional[CacheConfig] = None,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.qk_nope_head_dim = qk_nope_head_dim
+        self.qk_rope_head_dim = qk_rope_head_dim
+        self.qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
+        self.v_head_dim = v_head_dim
+
+        self.q_lora_rank = q_lora_rank
+        self.kv_lora_rank = kv_lora_rank
+
+        self.num_heads = num_heads
+        tp_size = get_tensor_model_parallel_world_size()
+        assert num_heads % tp_size == 0
+        self.num_local_heads = num_heads // tp_size
+
+        self.scaling = self.qk_head_dim**-0.5
+        self.rope_theta = rope_theta
+        self.max_position_embeddings = max_position_embeddings
+
+        if self.q_lora_rank is not None:
+            self.q_a_proj = ReplicatedLinear(self.hidden_size,
+                                             self.q_lora_rank,
+                                             bias=False,
+                                             quant_config=quant_config,
+                                             prefix=f"{prefix}.q_a_proj")
+            self.q_a_layernorm = RMSNorm(self.q_lora_rank,
+                                         eps=config.rms_norm_eps)
+            self.q_b_proj = ColumnParallelLinear(q_lora_rank,
+                                                 self.num_heads *
+                                                 self.qk_head_dim,
+                                                 bias=False,
+                                                 quant_config=quant_config,
+                                                 prefix=f"{prefix}.q_b_proj")
+        else:
+            self.q_proj = ColumnParallelLinear(self.hidden_size,
+                                               self.num_heads *
+                                               self.qk_head_dim,
+                                               bias=False,
+                                               quant_config=quant_config,
+                                               prefix=f"{prefix}.q_proj")
+
+        self.kv_a_proj_with_mqa = ReplicatedLinear(
+            self.hidden_size,
+            self.kv_lora_rank + self.qk_rope_head_dim,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.kv_a_proj_with_mqa")
+        self.kv_a_layernorm = RMSNorm(self.kv_lora_rank,
+                                      eps=config.rms_norm_eps)
+        self.kv_b_proj = ColumnParallelLinear(
+            self.kv_lora_rank,
+            self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.kv_b_proj")
+        self.o_proj = RowParallelLinear(self.num_heads * self.v_head_dim,
+                                        self.hidden_size,
+                                        bias=False,
+                                        quant_config=quant_config,
+                                        prefix=f"{prefix}.o_proj")
+
+        if rope_scaling:
+            rope_scaling["rope_type"] = 'deepseek_yarn'
+        self.rotary_emb = get_rope(qk_rope_head_dim,
+                                   rotary_dim=qk_rope_head_dim,
+                                   max_position=max_position_embeddings,
+                                   base=rope_theta,
+                                   rope_scaling=rope_scaling,
+                                   is_neox_style=False)
+        if rope_scaling:
+            mscale_all_dim = rope_scaling.get("mscale_all_dim", False)
+            scaling_factor = rope_scaling["factor"]
+            mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
+            self.scaling = self.scaling * mscale * mscale
+
+        # In the MLA backend, kv_cache includes both k_c and
+        # pe (i.e. decoupled position embeddings). In particular,
+        # the concat_and_cache_mla op requires
+        #     k_c.size(1) + k_pe.size(1) == kv_cache.size(2)
+        # i.e.
+        #     kv_lora_rank + qk_rope_head_dim == head_size
+        self.mla_attn = Attention(
+            num_heads=self.num_local_heads,
+            head_size=self.kv_lora_rank + self.qk_rope_head_dim,
+            scale=self.scaling,
+            num_kv_heads=1,
+            cache_config=cache_config,
+            quant_config=quant_config,
+            prefix=f"{prefix}.attn",
+            use_mla=True,
+            # MLA Args
+            q_lora_rank=self.q_lora_rank,
+            kv_lora_rank=self.kv_lora_rank,
+            qk_nope_head_dim=self.qk_nope_head_dim,
+            qk_rope_head_dim=self.qk_rope_head_dim,
+            qk_head_dim=self.qk_head_dim,
+            v_head_dim=self.v_head_dim,
+            rotary_emb=self.rotary_emb,
+            q_proj=self.q_proj if self.q_lora_rank is None else self.q_b_proj,
+            kv_b_proj=self.kv_b_proj,
+            o_proj=self.o_proj,
+        )
+
+        self.prefix = prefix
+        self.debug_layer_idx = int(self.prefix.split(".")[-2])
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.q_lora_rank is not None:
+            ckq = self.q_a_proj(hidden_states)[0]
+            hidden_states_or_q_c = self.q_a_layernorm(ckq)
+        else:
+            hidden_states_or_q_c = hidden_states
+        kv_c, k_pe = self.kv_a_proj_with_mqa(hidden_states)[0].split(
+            [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+        kv_c_normed = self.kv_a_layernorm(kv_c.contiguous())
+        return self.mla_attn(hidden_states_or_q_c,
+                             kv_c_normed,
+                             k_pe,
+                             output_shape=hidden_states.shape)
+
+    def forward_chunk(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        chunk_id: Optional[int] = None,
+        moe_pipe_degree: Optional[int] = None,
+    ) -> torch.Tensor:
+        if self.q_lora_rank is not None:
+            ckq = self.q_a_proj(hidden_states)[0]
+            hidden_states_or_q_c = self.q_a_layernorm(ckq)
+        else:
+            hidden_states_or_q_c = hidden_states
+        kv_c, k_pe = self.kv_a_proj_with_mqa(hidden_states)[0].split(
+            [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+        kv_c_normed = self.kv_a_layernorm(kv_c.contiguous())
+        return self.mla_attn.forward_chunk(hidden_states_or_q_c,
+                             kv_c_normed,
+                             k_pe,
+                             output_shape=hidden_states.shape,
+                             chunk_id=chunk_id,
+                             moe_pipe_degree=moe_pipe_degree)
+
+class DeepseekV2DecoderLayer(nn.Module):
+
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        prefix: str,
+        model_config: ModelConfig,
+        cache_config: Optional[CacheConfig] = None,
+        quant_config: Optional[QuantizationConfig] = None,
+    ) -> None:
+        super().__init__()
+        self.hidden_size = config.hidden_size
+        rope_theta = getattr(config, "rope_theta", 10000)
+        rope_scaling = getattr(config, "rope_scaling", None)
+        max_position_embeddings = getattr(config, "max_position_embeddings",
+                                          8192)
+        # DecoderLayers are created with `make_layers` which passes the prefix
+        # with the layer's index.
+        layer_idx = int(prefix.split(sep='.')[-1])
+        self.layer_idx = layer_idx
+        if model_config.use_mla:
+            attn_cls = DeepseekV2MLAAttention
+        else:
+            attn_cls = DeepseekV2Attention
+        self.self_attn = attn_cls(
+            config=config,
+            hidden_size=self.hidden_size,
+            num_heads=config.num_attention_heads,
+            qk_nope_head_dim=config.qk_nope_head_dim,
+            qk_rope_head_dim=config.qk_rope_head_dim,
+            v_head_dim=config.v_head_dim,
+            q_lora_rank=config.q_lora_rank
+            if hasattr(config, "q_lora_rank") else None,
+            kv_lora_rank=config.kv_lora_rank,
+            rope_theta=rope_theta,
+            rope_scaling=rope_scaling,
+            max_position_embeddings=max_position_embeddings,
+            cache_config=cache_config,
+            quant_config=quant_config,
+            prefix=f"{prefix}.self_attn",
+        )
+
+        if (config.n_routed_experts is not None
+                and layer_idx >= config.first_k_dense_replace
+                and layer_idx % config.moe_layer_freq == 0):
+            self.mlp = PipeDeepseekV2MoE(
+                config=config,
+                quant_config=quant_config,
+                prefix=f"{prefix}.mlp",
+            )
+        else:
+            self.mlp = DeepseekV2MLP(
+                hidden_size=config.hidden_size,
+                intermediate_size=config.intermediate_size,
+                hidden_act=config.hidden_act,
+                quant_config=quant_config,
+                prefix=f"{prefix}.mlp",
+            )
+        self.input_layernorm = RMSNorm(config.hidden_size,
+                                       eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(config.hidden_size,
+                                                eps=config.rms_norm_eps)
+        self.routed_scaling_factor = config.routed_scaling_factor
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        # Self Attention
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm(
+                hidden_states, residual)
+        hidden_states = self.self_attn(
+            positions=positions,
+            hidden_states=hidden_states,
+        )
+
+        if hidden_states.dtype == torch.float16:
+            # Fix FP16 overflow
+            # We scale both hidden_states and residual before
+            # rmsnorm, and rmsnorm result would not affect by scale.
+            hidden_states *= 1. / self.routed_scaling_factor
+        hidden_states, residual = self.post_attention_layernorm(
+            hidden_states, residual)
+        hidden_states = self.mlp(hidden_states)
+        if isinstance(self.mlp, DeepseekV2MLP) and \
+            hidden_states.dtype == torch.float16:
+            # This is a special case to avoid FP16 overflow
+            hidden_states *= 1. / self.routed_scaling_factor
+            residual *= 1. / self.routed_scaling_factor
+        return hidden_states, residual
+
+
+class PipeDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        prefix: str,
+        model_config: ModelConfig,
+        cache_config: Optional[CacheConfig] = None,
+        quant_config: Optional[QuantizationConfig] = None,
+    ) -> None:
+
+        super().__init__(config, prefix, model_config, cache_config, quant_config)
+        if isinstance(self.mlp, PipeDeepseekV2MoE):
+            # two stream for computation and communication
+            self.streams = [torch.cuda.Stream() for _ in range(2)]
+            # event for correct synchronization
+            self.events = [torch.cuda.Event()
+                           for _ in range(self.mlp.moe_pipe_degree)] * 4
+
+        # Then explicitly replace the MoE layer with PipeDeepseekV2MoE when needed
+        # layer_idx = int(prefix.split(sep='.')[-1])
+        # if (config.n_routed_experts is not None
+        #         and layer_idx >= config.first_k_dense_replace
+        #         and layer_idx % config.moe_layer_freq == 0):
+        #     self.mlp = PipeDeepseekV2MoE(
+        #         config=config,
+        #         quant_config=quant_config,
+        #         prefix=f"{prefix}.mlp",
+        #     )
+    def pad_chunk_to_alignment(self, chunk, alignment=32):
+        seq_len, hidden_size = chunk.shape
+        padded_len = ((seq_len + alignment - 1) // alignment) * alignment
+        
+        if padded_len > seq_len:
+            padding_size = padded_len - seq_len
+            padding = torch.zeros(padding_size, hidden_size, 
+                                dtype=chunk.dtype, device=chunk.device)
+            chunk = torch.cat([chunk, padding], dim=0)
+        
+        return chunk, seq_len
+
+    def _create_split_indices(self, seq_len: int, num_chunks: int, num_prefill_tokens: int, num_decode_tokens: int, positions: torch.Tensor) -> list:
+        """
+        Construct tensor split position array - GPU optimized version
+        
+        Args:
+            seq_len: Total sequence length
+            num_chunks: Number of chunks to split into
+            
+        Returns:
+            List of split positions for torch.tensor_split
+        """
+        if num_chunks <= 1:
+            return []
+            
+        # Compute entirely on GPU to avoid CPU-GPU data transfer
+        device = positions.device
+        
+        # Create token index tensor
+        token_indices = torch.arange(seq_len, device=device)
+        
+        # Calculate c values (position - 1)
+        c_values = positions - 1
+        
+        # Create prefill mask
+        prefill_mask = token_indices < num_prefill_tokens
+        
+        # Vectorized computation of costs for all tokens
+        costs = torch.where(
+            prefill_mask,
+            81920 * c_values + 332914688,  # prefill token cost
+            278528 * c_values + 299360256   # decode token cost
+        )
+        
+        # Calculate cumulative cost
+        cumulative_costs = torch.cumsum(costs, dim=0)
+        total_cost = cumulative_costs[-1]
+        
+        # Target cost per chunk
+        target_cost_per_chunk = total_cost / num_chunks
+        
+        # Find split points - using vectorized operations
+        # Calculate distance to target cost for each possible split point
+        target_costs = torch.arange(1, num_chunks, device=device) * target_cost_per_chunk
+        
+        # Use searchsorted to find positions closest to target cost
+        split_indices_tensor = torch.searchsorted(cumulative_costs, target_costs, right=False)
+        
+        # Ensure split points don't create empty chunks
+        # Adjust split points to ensure each chunk has at least one token
+        split_indices_tensor = torch.clamp(split_indices_tensor, 1, seq_len - 1)
+        
+        # Remove duplicates and sort (although searchsorted should already be sorted)
+        split_indices_tensor = torch.unique(split_indices_tensor, sorted=True)
+        
+        # Ensure the last chunk has enough tokens
+        if len(split_indices_tensor) > 0:
+            # Check if the last split point is too close to the sequence end
+            last_split = split_indices_tensor[-1]
+            if seq_len - last_split < 1:
+                # If the last chunk is empty, remove the last split point
+                split_indices_tensor = split_indices_tensor[:-1]
+        
+        # Convert to Python list and return
+        return split_indices_tensor.cpu().tolist() if len(split_indices_tensor) > 0 else []
+    
+    def _adjust_split_indices_for_alignment(self, split_indices: list, seq_len: int, num_prefill_tokens: int, adjustment_threshold: int = 2) -> list:
+        """
+        Adjust chunk sizes to multiples of 64 for prefill-only chunks when adjustment is within threshold.
+        
+        Args:
+            split_indices: Original split indices from _create_split_indices
+            seq_len: Total sequence length
+            num_prefill_tokens: Number of prefill tokens
+            adjustment_threshold: Maximum adjustment allowed to reach multiple of 64
+            
+        Returns:
+            Adjusted split indices list
+        """
+        if not split_indices:
+            return split_indices
+            
+        adjusted_indices = []
+        current_start = 0
+        
+        for i, split_idx in enumerate(split_indices):
+            chunk_size = split_idx - current_start
+            
+            # Check if this chunk contains only prefill tokens
+            is_prefill_only = split_idx <= num_prefill_tokens
+            
+            if is_prefill_only:
+                # Calculate the nearest multiple of 64 (round up)
+                target_size = ((chunk_size + 63) // 64) * 64
+                adjustment_needed = target_size - chunk_size
+                
+                # Only adjust if within threshold and doesn't exceed sequence bounds
+                if 0 < adjustment_needed <= adjustment_threshold:
+                    new_split_idx = current_start + target_size
+                    
+                    # Make sure we don't exceed sequence length or prefill boundary
+                    if new_split_idx <= min(seq_len, num_prefill_tokens):
+                        adjusted_indices.append(new_split_idx)
+                        current_start = new_split_idx
+                    else:
+                        # Keep original if adjustment would exceed bounds
+                        adjusted_indices.append(split_idx)
+                        current_start = split_idx
+                else:
+                    # Keep original if adjustment too large or no adjustment needed
+                    adjusted_indices.append(split_idx)
+                    current_start = split_idx
+            else:
+                # Keep original split index for chunks with decode tokens
+                adjusted_indices.append(split_idx)
+                current_start = split_idx
+        
+        return adjusted_indices
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        seq_len, hidden_dim = hidden_states.shape
+        num_prefill_tokens = 0
+        num_decode_tokens = 0
+
+        event_start = torch.cuda.Event(enable_timing=True)
+        event_end = torch.cuda.Event(enable_timing=True)
+        event_start.record()
+        
+        try:
+            attn_metadata = get_forward_context().attn_metadata
+            if attn_metadata is not None:
+                num_decode_tokens = attn_metadata.num_decodes
+        except Exception as e:
+            print(f"Warning: Could not get attn_metadata from forward context: {e}")
+            pass
+
+        num_prefill_tokens = seq_len - num_decode_tokens
+        #print(f"num_prefill_tokens: {num_prefill_tokens}, num_decode_tokens: {num_decode_tokens}")
+
+       
+        if (isinstance(self.mlp, PipeDeepseekV2MoE) and PIPE_ON and
+            seq_len >= self.mlp.moe_pipe_degree):
+            
+            if get_dp_group().rank_in_group == 0 and get_tensor_model_parallel_rank() == 0:
+                torch.cuda.nvtx.range_push(
+                    f"DeepseekV2DecoderLayer {self.layer_idx} MLP forward")
+        
+           
+            moe_input_buffer = torch.empty_like(hidden_states)
+            moe_layer = self.mlp
+            
+            if residual is None:
+                residual = hidden_states
+                hidden_states = self.input_layernorm(hidden_states)
+            else:
+                hidden_states, residual = self.input_layernorm(
+                    hidden_states, residual)
+                                
+            seq_len = hidden_states.shape[0]
+            split_indices = self._create_split_indices(seq_len, self.mlp.moe_pipe_degree, num_prefill_tokens, num_decode_tokens, positions)
+            
+            # Adjust chunk sizes to multiples of 64 for prefill-only chunks (within threshold of 2)
+            #split_indices = self._adjust_split_indices_for_alignment(split_indices, seq_len, num_prefill_tokens, adjustment_threshold=2)
+            
+            hidden_states_chunks = torch.tensor_split(hidden_states, split_indices, dim=0)
+            residual_output_chunks = torch.tensor_split(residual, split_indices, dim=0)
+
+            moe_input_buffer = torch.empty_like(hidden_states)
+            moe_input_buffer_start = 0  
+            moe_input_buffer_end = 0    
+            
+            mlp_output_list = [None] * self.mlp.moe_pipe_degree
+            residual_list = [None] * self.mlp.moe_pipe_degree
+
+            # MoE pipeline parallel processing: perform attention computation and MoE preprocessing for each chunk
+            for chunk_idx in range(self.mlp.moe_pipe_degree):
+                # Stream 0: Execute attention and gating computation
+                with torch.cuda.stream(self.streams[0]):
+                    # Get current chunk data
+                    hidden_states = hidden_states_chunks[chunk_idx]
+                    residual = residual_output_chunks[chunk_idx]
+                    chunk_seq_len = hidden_states.shape[0]
+                
+                    # NVTX performance profiling marker
+                    if get_dp_group().rank_in_group == 0 and get_tensor_model_parallel_rank() == 0:
+                        torch.cuda.nvtx.range_push(
+                            f"MLA forward")
+                    
+                    # Execute multi-head attention computation
+                    hidden_states = self.self_attn.forward_chunk(
+                        positions=positions[:chunk_seq_len],  # Adjust position encoding to match chunk size
+                        hidden_states=hidden_states,
+                        chunk_id=chunk_idx,                   # Chunk identifier for caching and optimization
+                        moe_pipe_degree=self.mlp.moe_pipe_degree,  # Pipeline parallelism degree
+                    )
+                    
+                    if get_dp_group().rank_in_group == 0 and get_tensor_model_parallel_rank() == 0:
+                        torch.cuda.nvtx.range_pop()
+
+                    # FP16 overflow protection: scale hidden states
+                    if hidden_states.dtype == torch.float16:
+                        # This is a special case to avoid FP16 overflow
+                        hidden_states *= 1. / self.routed_scaling_factor
+                    
+                    # Layer normalization after attention
+                    hidden_states, residual = self.post_attention_layernorm(
+                        hidden_states, residual)
+                    
+                    # Prepare MoE input data
+                    moe_input = hidden_states
+                    
+                    # MoE expert gating: decide which experts each token routes to
+                    moe_layer.gating(moe_input, residual, chunk_idx)
+                    
+                    # Record event and synchronize, prepare for next stage
+                    self.events[chunk_idx + self.mlp.moe_pipe_degree * 0].record()
+                    torch.cuda.synchronize()
+                
+                # Stream 1: Execute data dispatch to experts
+                with torch.cuda.stream(self.streams[1]):
+                    # Wait for gating stage to complete
+                    self.events[chunk_idx + self.mlp.moe_pipe_degree * 0].wait()
+                    # Data dispatch: distribute tokens to corresponding experts
+                    moe_layer.dispatch(chunk_idx)
+                    self.events[chunk_idx + self.mlp.moe_pipe_degree * 1].record()
+
+            for chunk_idx in range(self.mlp.moe_pipe_degree):  
+                with torch.cuda.stream(self.streams[0]):
+                    self.events[chunk_idx + self.mlp.moe_pipe_degree * 1].wait()
+                    moe_layer.MoEFwd(chunk_idx)
+                    self.events[chunk_idx + self.mlp.moe_pipe_degree * 2].record()
+                
+                with torch.cuda.stream(self.streams[1]):
+                    self.events[chunk_idx + self.mlp.moe_pipe_degree * 2].wait()
+                    moe_layer.combine(chunk_idx)
+                    self.events[chunk_idx + self.mlp.moe_pipe_degree * 3].record()
+
+            for chunk_idx in range(self.mlp.moe_pipe_degree):
+                self.events[chunk_idx + self.mlp.moe_pipe_degree * 3].wait()
+                    
+                hidden_states, residual = moe_layer.post_MoE(chunk_idx)
+                mlp_output_list[chunk_idx] = hidden_states
+                residual_list[chunk_idx] = residual
+                
+                
+            hidden_states = torch.cat(mlp_output_list, dim=0)
+            residual = torch.cat(residual_list, dim=0)
+            
+            torch.cuda.synchronize()
+            if get_dp_group().rank_in_group == 0 and get_tensor_model_parallel_rank() == 0:
+                torch.cuda.nvtx.range_pop()
+                
+            #return hidden_states, residual
+
+        else:
+            if residual is None:
+                residual = hidden_states
+                hidden_states = self.input_layernorm(hidden_states)
+            else:
+                hidden_states, residual = self.input_layernorm(
+                hidden_states, residual)
+            
+            hidden_states = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+            )
+            if hidden_states.dtype == torch.float16:
+                hidden_states *= 1. / self.routed_scaling_factor
+
+            hidden_states, residual = self.post_attention_layernorm(
+                hidden_states, residual)
+
+            if get_dp_group().rank_in_group == 0 and get_tensor_model_parallel_rank() == 0:
+                torch.cuda.nvtx.range_push(
+                    f"DeepseekV2DecoderLayer {self.layer_idx} MLP forward")
+            hidden_states = self.mlp(hidden_states)
+            if get_dp_group().rank_in_group == 0 and get_tensor_model_parallel_rank() == 0:
+                torch.cuda.nvtx.range_pop()
+
+            if isinstance(self.mlp, DeepseekV2MLP) and \
+                hidden_states.dtype == torch.float16:
+                hidden_states *= 1. / self.routed_scaling_factor
+                residual *= 1. / self.routed_scaling_factor
+
+
+        event_end.record()
+        torch.cuda.synchronize()
+           
+        if (get_tensor_model_parallel_rank() == 0 and seq_len != 256 and seq_len != 8192 and seq_len != 1):
+            print(f"Prefill layer {self.layer_idx} forward time: {event_start.elapsed_time(event_end)} ms")
+        
+        return hidden_states, residual
+
+
+@support_torch_compile
+class DeepseekV2Model(nn.Module):
+
+    fall_back_to_pt_during_load = False
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        super().__init__()
+
+        # Extract configuration early to avoid recomputing during tracing
+        config = vllm_config.model_config.hf_config
+        model_config = vllm_config.model_config
+        cache_config = vllm_config.cache_config
+        quant_config = vllm_config.quant_config
+        # use_pipe = PIPE_ON
+
+        self.vocab_size = config.vocab_size
+
+        if get_pp_group().is_first_rank:
+            self.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+                quant_config=quant_config,
+                prefix=f"{prefix}.embed_tokens")
+        else:
+            self.embed_tokens = PPMissingLayer()
+
+        self.start_layer, self.end_layer, self.layers = make_layers(
+            config.num_hidden_layers,
+            lambda prefix: PipeDeepseekV2DecoderLayer(
+                config,
+                prefix,
+                model_config=model_config,
+                cache_config=cache_config,
+                quant_config=quant_config,
+            ),
+            prefix=f"{prefix}.layers")
+
+        if get_pp_group().is_last_rank:
+            self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        else:
+            self.norm = PPMissingLayer()
+        self.make_empty_intermediate_tensors = (
+            make_empty_intermediate_tensors_factory(
+                ["hidden_states", "residual"], config.hidden_size))
+
+    def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.embed_tokens(input_ids)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,  
+        positions: torch.Tensor,
+        intermediate_tensors: Optional[IntermediateTensors], 
+        inputs_embeds: Optional[torch.Tensor] = None, 
+    ) -> Union[torch.Tensor, IntermediateTensors]:
+        
+        if get_pp_group().is_first_rank:
+            if inputs_embeds is not None:
+                hidden_states = inputs_embeds
+            else:
+                hidden_states = self.get_input_embeddings(input_ids)
+            residual = None
+        else:
+            assert intermediate_tensors is not None, "Non-first rank must provide intermediate tensors"
+            hidden_states = intermediate_tensors["hidden_states"]  
+            residual = intermediate_tensors["residual"]  
+
+        for layer in self.layers[self.start_layer:self.end_layer]:
+            hidden_states, residual = layer(positions, hidden_states, residual)
+        
+        torch.cuda.synchronize()
+        
+        hidden_states, _ = self.norm(hidden_states, residual)
+        
+        return hidden_states
+
+
+class DeepseekV2ForCausalLM(nn.Module, SupportsPP):
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        super().__init__()
+        config = vllm_config.model_config.hf_config
+        quant_config = vllm_config.quant_config
+        self.config = config
+        self.quant_config = quant_config
+        self.model = DeepseekV2Model(vllm_config=vllm_config,
+                                     prefix=maybe_prefix(prefix, "model"))
+        if get_pp_group().is_last_rank:
+            self.lm_head = ParallelLMHead(config.vocab_size,
+                                          config.hidden_size,
+                                          quant_config=quant_config)
+        else:
+            self.lm_head = PPMissingLayer()
+        self.logits_processor = LogitsProcessor(config.vocab_size)
+        self.make_empty_intermediate_tensors = (
+            self.model.make_empty_intermediate_tensors)
+
+    def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.model.get_input_embeddings(input_ids)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        intermediate_tensors: Optional[IntermediateTensors] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, IntermediateTensors]:
+        hidden_states = self.model(input_ids, positions, intermediate_tensors,
+                                   inputs_embeds)
+        return hidden_states
+
+    def compute_logits(
+        self,
+        hidden_states: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+    ) -> Optional[torch.Tensor]:
+        logits = self.logits_processor(self.lm_head, hidden_states,
+                                       sampling_metadata)
+        return logits
+
+    def make_empty_intermediate_tensors(
+            self, batch_size: int, dtype: torch.dtype,
+            device: torch.device) -> IntermediateTensors:
+        return IntermediateTensors({
+            "hidden_states":
+            torch.zeros((batch_size, self.config.hidden_size),
+                        dtype=dtype,
+                        device=device),
+            "residual":
+            torch.zeros((batch_size, self.config.hidden_size),
+                        dtype=dtype,
+                        device=device),
+        })
+
+    def load_weights(self, weights: Iterable[Tuple[str,
+                                                   torch.Tensor]]) -> Set[str]:
+        stacked_params_mapping = [
+            # (param_name, shard_name, shard_id)
+            ("gate_up_proj", "gate_proj", 0),
+            ("gate_up_proj", "up_proj", 1),
+        ]
+
+        # Params for weights, fp8 weight scales, fp8 activation scales
+        # (param_name, weight_name, expert_id, shard_id)
+        expert_params_mapping = FusedMoE.make_expert_params_mapping(
+            ckpt_gate_proj_name="gate_proj",
+            ckpt_down_proj_name="down_proj",
+            ckpt_up_proj_name="up_proj",
+            num_experts=self.config.n_routed_experts)
+
+        params_dict = dict(self.named_parameters())
+        loaded_params: Set[str] = set()
+        for name, loaded_weight in weights:
+            if "rotary_emb.inv_freq" in name:
+                continue
+
+            spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
+            if spec_layer is not None:
+                continue  # skip spec decode layers for main model
+
+            for (param_name, weight_name, shard_id) in stacked_params_mapping:
+                # Skip non-stacked layers and experts (experts handled below).
+                if weight_name not in name:
+                    continue
+                # We have mlp.experts[0].gate_proj in the checkpoint.
+                # Since we handle the experts below in expert_params_mapping,
+                # we need to skip here BEFORE we update the name, otherwise
+                # name will be updated to mlp.experts[0].gate_up_proj, which
+                # will then be updated below in expert_params_mapping
+                # for mlp.experts[0].gate_gate_up_proj, which breaks load.
+                if (("mlp.experts." in name) and name not in params_dict):
+                    continue
+                name = name.replace(weight_name, param_name)
+                # Skip loading extra bias for GPTQ models.
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+
+                if is_pp_missing_parameter(name, self):
+                    continue
+
+                param = params_dict[name]
+                weight_loader = param.weight_loader
+                weight_loader(param, loaded_weight, shard_id)
+                break
+            else:
+                for mapping in expert_params_mapping:
+                    param_name, weight_name, expert_id, shard_id = mapping
+                    if weight_name not in name:
+                        continue
+                    name = name.replace(weight_name, param_name)
+
+                    if is_pp_missing_parameter(name, self):
+                        continue
+
+                    param = params_dict[name]
+                    weight_loader = param.weight_loader
+                    weight_loader(param,
+                                  loaded_weight,
+                                  name,
+                                  shard_id=shard_id,
+                                  expert_id=expert_id)
+                    break
+                else:
+                    # Skip loading extra bias for GPTQ models.
+                    if name.endswith(".bias") and name not in params_dict:
+                        continue
+
+                    # Remapping the name of FP8 kv-scale.
+                    name = maybe_remap_kv_scale_name(name, params_dict)
+                    if name is None:
+                        continue
+
+                    if is_pp_missing_parameter(name, self):
+                        continue
+
+                    param = params_dict[name]
+                    weight_loader = getattr(param, "weight_loader",
+                                            default_weight_loader)
+                    weight_loader(param, loaded_weight)
+            loaded_params.add(name)
+        return loaded_params
+
+
+class DeepseekV3ForCausalLM(DeepseekV2ForCausalLM):
+    pass
+
+
+def get_spec_layer_idx_from_weight_name(config: PretrainedConfig,
+                                        weight_name: str) -> Optional[int]:
+    if hasattr(config,
+               "num_nextn_predict_layers") and (config.num_nextn_predict_layers
+                                                > 0):
+        layer_idx = config.num_hidden_layers
+        for i in range(config.num_nextn_predict_layers):
+            if weight_name.startswith(f"model.layers.{layer_idx+i}."):
+                return layer_idx + i
+    return None

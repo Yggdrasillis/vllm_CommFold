@@ -1,0 +1,6 @@
+__pycache__/
+DeepSeek-V3/
+*.txt
+*.pt
+*.whl
+*.nsys-rep
