@@ -1,7 +1,7 @@
 from vllm import LLM
 
 
-llm = LLM(model="../scripts/DeepSeek-V3",
+llm = LLM(model="../model/DeepSeek-V3",
         trust_remote_code=True, tensor_parallel_size=2, 
         enable_expert_parallel=True, enforce_eager=True,
         hf_overrides={"moe_pipe_degree": 2})
